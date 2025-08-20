@@ -1,0 +1,12 @@
+{
+  "name": "pretty-nginx-file-index",
+  "version": "1.0.0",
+  "private": true,
+  "devDependencies": {
+    "@playwright/test": "^1.41.1",
+    "adm-zip": "^0.5.10"
+  },
+  "scripts": {
+    "test:e2e": "node tests/zipDownload.test.js"
+  }
+}

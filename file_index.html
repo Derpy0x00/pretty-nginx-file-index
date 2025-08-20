@@ -79,6 +79,9 @@
                     <label><input type="checkbox" id="include-subdirectories">Include subdirectories</label>
                 </div>
                 <div class="btn-croup btn-group-sm" style="float: right;/** God, I hate css**/">
+                    <button type="button" id="download-zip-button" class="btn btn-default"><i
+                            class="far fa-file-archive"></i>&nbsp;Download ZIP
+                    </button>
                     <button type="button" id="copy-downloads-button" class="btn btn-default"><i
                             class="far fa-clipboard"></i>&nbsp;Copy To Clipboard
                     </button>
@@ -144,6 +147,10 @@
     document.getElementById("copy-downloads-button").addEventListener("click", function () {
         document.getElementById("download-links").select();
         document.execCommand("copy");
+    });
+
+    document.getElementById("download-zip-button").addEventListener("click", function () {
+        downloadAllAsZip();
     });
 
     let current_page_data = {};
@@ -253,6 +260,26 @@
         }
     }
 
+    async function collect_files(page_data, url_path, outFiles, getRecursive = false) {
+        for (let entry of page_data) {
+            let entry_name = encodeURIComponent(entry.name.replace("/", ""));
+            if (entry.type === "directory") {
+                if (getRecursive) {
+                    let recursion_url = url_path + entry_name + "/";
+                    let sub_page = await fetch_page_json(recursion_url);
+                    await collect_files(sub_page, recursion_url, outFiles, true);
+                }
+                continue;
+            }
+            outFiles.push({
+                name: url_path.substring(5).replace(window.location.pathname, "") + entry_name,
+                url: window.location.origin + url_path.substring(5) + entry_name,
+                mtime: entry.mtime,
+                size: entry.size
+            });
+        }
+    }
+
     async function fetch_page_json(url) {
         let resp = await fetch(url);
         if (resp.status !== 200) {
@@ -270,6 +297,145 @@
         const includeSub = document.getElementById("include-subdirectories");
         textField.value = "";
         collect_dl_links(current_page_data, "/list" + window.location.pathname, textField, includeSub.checked);
+    }
+
+    async function downloadAllAsZip() {
+        const includeSub = document.getElementById("include-subdirectories").checked;
+        const files = [];
+        await collect_files(current_page_data, "/list" + window.location.pathname, files, includeSub);
+        if (files.length === 0) {
+            return;
+        }
+
+        const encoder = new TextEncoder();
+        const fileEntries = [];
+        let offset = 0;
+
+        const stream = new ReadableStream({
+            async start(controller) {
+                for (const f of files) {
+                    const resp = await fetch(f.url);
+                    const data = new Uint8Array(await resp.arrayBuffer());
+                    const crc = crc32(data);
+                    const nameBytes = encoder.encode(f.name);
+                    const dos = dateToDos(new Date(f.mtime));
+
+                    const header = new Uint8Array(30 + nameBytes.length);
+                    let p = 0;
+                    header.set([0x50, 0x4b, 0x03, 0x04], p); p += 4;
+                    header[p++] = 0x14; header[p++] = 0x00; // version
+                    header[p++] = 0x00; header[p++] = 0x00; // flags
+                    header[p++] = 0x00; header[p++] = 0x00; // compression
+                    writeUint16LE(header, p, dos.time); p += 2;
+                    writeUint16LE(header, p, dos.date); p += 2;
+                    writeUint32LE(header, p, crc); p += 4;
+                    writeUint32LE(header, p, data.length); p += 4;
+                    writeUint32LE(header, p, data.length); p += 4;
+                    writeUint16LE(header, p, nameBytes.length); p += 2;
+                    writeUint16LE(header, p, 0); p += 2; // extra length
+                    header.set(nameBytes, p);
+
+                    controller.enqueue(header);
+                    controller.enqueue(data);
+
+                    fileEntries.push({
+                        nameBytes: nameBytes,
+                        crc: crc,
+                        size: data.length,
+                        offset: offset,
+                        dos: dos
+                    });
+                    offset += header.length + data.length;
+                }
+
+                const cdStart = offset;
+                for (const fe of fileEntries) {
+                    const cd = new Uint8Array(46 + fe.nameBytes.length);
+                    let q = 0;
+                    cd.set([0x50, 0x4b, 0x01, 0x02], q); q += 4;
+                    cd[q++] = 0x14; cd[q++] = 0x00; // version made by
+                    cd[q++] = 0x14; cd[q++] = 0x00; // version needed
+                    cd[q++] = 0x00; cd[q++] = 0x00; // flags
+                    cd[q++] = 0x00; cd[q++] = 0x00; // compression
+                    writeUint16LE(cd, q, fe.dos.time); q += 2;
+                    writeUint16LE(cd, q, fe.dos.date); q += 2;
+                    writeUint32LE(cd, q, fe.crc); q += 4;
+                    writeUint32LE(cd, q, fe.size); q += 4;
+                    writeUint32LE(cd, q, fe.size); q += 4;
+                    writeUint16LE(cd, q, fe.nameBytes.length); q += 2;
+                    writeUint16LE(cd, q, 0); q += 2; // extra
+                    writeUint16LE(cd, q, 0); q += 2; // comment
+                    writeUint16LE(cd, q, 0); q += 2; // disk number
+                    writeUint16LE(cd, q, 0); q += 2; // internal attrs
+                    writeUint32LE(cd, q, 0); q += 4; // external attrs
+                    writeUint32LE(cd, q, fe.offset); q += 4;
+                    cd.set(fe.nameBytes, q);
+                    controller.enqueue(cd);
+                    offset += cd.length;
+                }
+
+                const cdSize = offset - cdStart;
+                const end = new Uint8Array(22);
+                let e = 0;
+                end.set([0x50, 0x4b, 0x05, 0x06], e); e += 4;
+                writeUint16LE(end, e, 0); e += 2; // disk number
+                writeUint16LE(end, e, 0); e += 2; // start disk
+                writeUint16LE(end, e, fileEntries.length); e += 2; // entries on disk
+                writeUint16LE(end, e, fileEntries.length); e += 2; // total entries
+                writeUint32LE(end, e, cdSize); e += 4;
+                writeUint32LE(end, e, cdStart); e += 4;
+                writeUint16LE(end, e, 0); e += 2; // comment length
+                controller.enqueue(end);
+                controller.close();
+            }
+        });
+
+        const blob = await new Response(stream).blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "download.zip";
+        a.click();
+        URL.revokeObjectURL(url);
+    }
+
+    function writeUint16LE(buf, pos, val) {
+        buf[pos] = val & 0xff;
+        buf[pos + 1] = (val >> 8) & 0xff;
+    }
+
+    function writeUint32LE(buf, pos, val) {
+        buf[pos] = val & 0xff;
+        buf[pos + 1] = (val >> 8) & 0xff;
+        buf[pos + 2] = (val >> 16) & 0xff;
+        buf[pos + 3] = (val >> 24) & 0xff;
+    }
+
+    function dateToDos(d) {
+        let year = d.getFullYear();
+        if (year < 1980) {
+            year = 1980;
+        }
+        return {
+            time: (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1),
+            date: ((year - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate()
+        };
+    }
+
+    const crcTable = new Uint32Array(256).map((_, n) => {
+        let c = n;
+        for (let k = 0; k < 8; k++) {
+            c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+        }
+        return c >>> 0;
+    });
+
+    function crc32(data) {
+        let crc = -1;
+        for (let i = 0; i < data.length; i++) {
+            crc = (crc >>> 8) ^ crcTable[(crc ^ data[i]) & 0xff];
+        }
+        return (crc ^ -1) >>> 0;
     }
 
     function escape_HTML(html_str) {
